@@ -159,7 +159,6 @@ function parseCSVLine(line) {
   return result;
 }
 
-// Returns index or -1. Checks plain name first, then [name]. No stripping ever.
 function resolveColIdx(headers, name) {
   let idx = headers.indexOf(name);
   if (idx !== -1) { log('Column "' + name + '" → found as-is'); return idx; }
@@ -192,7 +191,6 @@ function processCSV(text) {
     return;
   }
 
-  // Resolve all required columns
   const indices = {};
   const missing = [];
 
@@ -202,7 +200,6 @@ function processCSV(text) {
     else indices[col] = idx;
   }
 
-  // TimeInMs: try as-is and bracketed first, then fall back to TimeInSeconds
   let timeColIdx = resolveColIdx(headers, 'TimeInMs');
   let timeIsSeconds = false;
   if (timeColIdx === -1) {
@@ -230,7 +227,6 @@ function processCSV(text) {
     if (lines[i].trim()) dataLines.push(lines[i]);
   }
 
-  // Use full JS float64 precision throughout — no rounding until final output
   let sumSim = 0, sumPC = 0, validCount = 0;
   const parsed = [];
 
@@ -240,22 +236,33 @@ function processCSV(text) {
     const disp  = parseFloat(cols[indices['MsBetweenDisplayChange']]);
     const pc    = parseFloat(cols[indices['MsPCLatency']]);
     const until = parseFloat(cols[indices['MsUntilDisplayed']]);
-    // Convert to ms at read time if needed — full precision multiplication
     const rawTime = parseFloat(cols[indices['_time']]);
     const tim = timeIsSeconds ? rawTime * 1000 : rawTime;
     parsed.push({ cols, sim, disp, pc, tim, until });
     if (!isNaN(sim) && !isNaN(pc)) { sumSim += sim; sumPC += pc; validCount++; }
   }
 
-  progressBar.style.width = '78%';
-  progressLabel.textContent = 'Calculating per-frame latency…';
+  progressBar.style.width = '72%';
+  progressLabel.textContent = 'Pass 1: computing final drift…';
 
-  // Keep full float64 precision — only round at the very end when writing to CSV
   const avgSim = sumSim / validCount;
   const avgPC  = sumPC  / validCount;
   const avgFL  = avgPC - avgSim / 2;
 
+  // Pass 1: find finalCumDrift
   let cumDrift = 0;
+  for (let i = 0; i < parsed.length; i++) {
+    const { sim, disp } = parsed[i];
+    if (!isNaN(sim) && !isNaN(disp)) cumDrift += (disp - sim);
+  }
+  const finalCumDrift = cumDrift;
+  const driftOffset = -finalCumDrift / 2;
+
+  progressBar.style.width = '82%';
+  progressLabel.textContent = 'Pass 2: calculating per-frame latency…';
+
+  // Pass 2: apply centered cumsum
+  cumDrift = driftOffset;
   let flMin = Infinity, flMax = -Infinity;
   const flValues = [], fsValues = [];
 
@@ -272,6 +279,13 @@ function processCSV(text) {
     }
   }
 
+  // Compute true row average — identical to what a spreadsheet AVERAGE() would give
+  let sumFL = 0, flCount = 0;
+  for (let i = 0; i < flValues.length; i++) {
+    if (!isNaN(flValues[i])) { sumFL += flValues[i]; flCount++; }
+  }
+  const trueRowAvgFL = sumFL / flCount;
+
   progressBar.style.width = '90%';
   progressLabel.textContent = 'Building output CSV…';
 
@@ -283,7 +297,6 @@ function processCSV(text) {
   for (let i = 0; i < parsed.length; i++) {
     const fl = flValues[i];
     const fs = fsValues[i];
-    // Write at full float64 precision — up to 15 significant digits
     outputLines.push(
       parsed[i].cols.join(',') + ',' +
       (isNaN(fs) ? '' : fs.toPrecision(15).replace(/\.?0+$/, '')) + ',' +
@@ -295,10 +308,18 @@ function processCSV(text) {
   progressBar.style.width = '100%';
   progressLabel.textContent = 'Done — ' + validCount.toLocaleString() + ' rows processed';
 
-  log('Header at line ' + (headerLineIdx + 1));
-  log('Avg MsBetweenSimulationStart: ' + avgSim + ' ms');
-  log('Avg MsPCLatency: ' + avgPC + ' ms');
-  log('Avg Framelatency = ' + avgPC + ' − ' + (avgSim / 2) + ' = ' + avgFL + ' ms');
+  log('─────────────────────────────────');
+  log('Avg MsBetweenSimulationStart : ' + avgSim + ' ms');
+  log('Avg MsPCLatency              : ' + avgPC + ' ms');
+  log('avgFL anchor                 : ' + avgFL + ' ms');
+  log('─────────────────────────────────');
+  log('Final cumDrift (uncentered)  : ' + finalCumDrift + ' ms');
+  log('Centering offset             : ' + driftOffset + ' ms');
+  log('─────────────────────────────────');
+  log('Row avg Framelatency         : ' + trueRowAvgFL + ' ms');
+  log('avgFL anchor                 : ' + avgFL + ' ms');
+  log('Residual (row avg − anchor)  : ' + (trueRowAvgFL - avgFL) + ' ms');
+  log('─────────────────────────────────');
   log('FL range: ' + flMin + ' – ' + flMax + ' ms');
   log('Export: ' + importedFileName + '_enriched.csv');
 
