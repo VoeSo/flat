@@ -219,8 +219,8 @@ function processCSV(text) {
     return;
   }
 
-  progressBar.style.width = '65%';
-  progressLabel.textContent = 'Computing averages…';
+  progressBar.style.width = '60%';
+  progressLabel.textContent = 'Parsing rows…';
 
   const dataLines = [];
   for (let i = headerLineIdx + 1; i < lines.length; i++) {
@@ -232,44 +232,56 @@ function processCSV(text) {
 
   for (let i = 0; i < dataLines.length; i++) {
     const cols = parseCSVLine(dataLines[i]);
-    const sim   = parseFloat(cols[indices['MsBetweenSimulationStart']]);
-    const disp  = parseFloat(cols[indices['MsBetweenDisplayChange']]);
-    const pc    = parseFloat(cols[indices['MsPCLatency']]);
-    const until = parseFloat(cols[indices['MsUntilDisplayed']]);
+    const sim     = parseFloat(cols[indices['MsBetweenSimulationStart']]);
+    const disp    = parseFloat(cols[indices['MsBetweenDisplayChange']]);
+    const pc      = parseFloat(cols[indices['MsPCLatency']]);
+    const until   = parseFloat(cols[indices['MsUntilDisplayed']]);
     const rawTime = parseFloat(cols[indices['_time']]);
-    const tim = timeIsSeconds ? rawTime * 1000 : rawTime;
+    const tim     = timeIsSeconds ? rawTime * 1000 : rawTime;
     parsed.push({ cols, sim, disp, pc, tim, until });
     if (!isNaN(sim) && !isNaN(pc)) { sumSim += sim; sumPC += pc; validCount++; }
   }
-
-  progressBar.style.width = '72%';
-  progressLabel.textContent = 'Pass 1: computing final drift…';
 
   const avgSim = sumSim / validCount;
   const avgPC  = sumPC  / validCount;
   const avgFL  = avgPC - avgSim / 2;
 
-  // Pass 1: find finalCumDrift
-  let cumDrift = 0;
+  // ── Pass 1: build the full cumDrift series ─────────────────────────────────
+  progressBar.style.width = '68%';
+  progressLabel.textContent = 'Pass 1: building cumDrift series…';
+
+  const cumDriftSeries = new Float64Array(parsed.length);
+  let cd = 0;
   for (let i = 0; i < parsed.length; i++) {
     const { sim, disp } = parsed[i];
-    if (!isNaN(sim) && !isNaN(disp)) cumDrift += (disp - sim);
+    if (!isNaN(sim) && !isNaN(disp)) cd += (disp - sim);
+    cumDriftSeries[i] = cd;
   }
-  const finalCumDrift = cumDrift;
-  const driftOffset = -finalCumDrift / 2;
+  const finalCumDrift = cd;
 
-  progressBar.style.width = '82%';
-  progressLabel.textContent = 'Pass 2: calculating per-frame latency…';
+  // ── Pass 2: compute exact mean of the cumDrift series ─────────────────────
+  progressBar.style.width = '76%';
+  progressLabel.textContent = 'Pass 2: computing exact drift mean…';
 
-  // Pass 2: apply centered cumsum
-  cumDrift = driftOffset;
+  let sumCumDrift = 0, cdCount = 0;
+  for (let i = 0; i < parsed.length; i++) {
+    const { sim, disp } = parsed[i];
+    if (!isNaN(sim) && !isNaN(disp)) { sumCumDrift += cumDriftSeries[i]; cdCount++; }
+  }
+  // This is the exact mean of the cumDrift series — negating it zeros the bias perfectly
+  const exactDriftOffset = -(sumCumDrift / cdCount);
+
+  // ── Pass 3: apply exact offset, compute final columns ─────────────────────
+  progressBar.style.width = '84%';
+  progressLabel.textContent = 'Pass 3: applying exact offset…';
+
   let flMin = Infinity, flMax = -Infinity;
   const flValues = [], fsValues = [];
 
   for (let i = 0; i < parsed.length; i++) {
     const { sim, disp, tim, until } = parsed[i];
-    if (!isNaN(sim) && !isNaN(disp)) cumDrift += (disp - sim);
-    const fl = (!isNaN(sim) && !isNaN(disp)) ? avgFL + cumDrift : NaN;
+    const valid = !isNaN(sim) && !isNaN(disp);
+    const fl = valid ? avgFL + exactDriftOffset + cumDriftSeries[i] : NaN;
     const fs = (!isNaN(tim) && !isNaN(until) && !isNaN(fl)) ? tim + until - fl : NaN;
     flValues.push(fl);
     fsValues.push(fs);
@@ -279,14 +291,14 @@ function processCSV(text) {
     }
   }
 
-  // Compute true row average — identical to what a spreadsheet AVERAGE() would give
+  // True row average — must now match avgFL to float64 precision
   let sumFL = 0, flCount = 0;
   for (let i = 0; i < flValues.length; i++) {
     if (!isNaN(flValues[i])) { sumFL += flValues[i]; flCount++; }
   }
   const trueRowAvgFL = sumFL / flCount;
 
-  progressBar.style.width = '90%';
+  progressBar.style.width = '92%';
   progressLabel.textContent = 'Building output CSV…';
 
   const newHeader = [...headers, 'FrameStart', 'Framelatency'];
@@ -313,8 +325,9 @@ function processCSV(text) {
   log('Avg MsPCLatency              : ' + avgPC + ' ms');
   log('avgFL anchor                 : ' + avgFL + ' ms');
   log('─────────────────────────────────');
-  log('Final cumDrift (uncentered)  : ' + finalCumDrift + ' ms');
-  log('Centering offset             : ' + driftOffset + ' ms');
+  log('Final cumDrift               : ' + finalCumDrift + ' ms');
+  log('Naive offset (÷2)            : ' + (-finalCumDrift / 2) + ' ms');
+  log('Exact offset (true mean)     : ' + exactDriftOffset + ' ms');
   log('─────────────────────────────────');
   log('Row avg Framelatency         : ' + trueRowAvgFL + ' ms');
   log('avgFL anchor                 : ' + avgFL + ' ms');
